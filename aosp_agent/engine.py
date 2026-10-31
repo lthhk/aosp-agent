@@ -21,6 +21,130 @@ from . import symbols
 
 _HUNK_RESULT_RE = re.compile(
     r"^\s*HUNK-RESULT\s+(\S+)\s+(implemented|need_not_ported):?\s+(.+?)\s*$", re.MULTILINE)
+_METADATA_PATH_RE = re.compile(
+    r"(?:^|/)(?:METADATA|README\.version|OWNERS|Android\.patch|[^/]+\.(?:bp|mk))$")
+_METADATA_LINE_RE = re.compile(
+    r"SQLITE_VERSION\s|SQLITE_VERSION_NUMBER\s|SQLITE_SOURCE_ID\s|VERSION\s*=|"
+    r"PATCHLEVEL\s*=|Copyright|License|Changelog|Changes\s*$", re.I)
+_NUMBER_RE = re.compile(r"\d+(?:\.\d+)*")
+_DOTTED_NUMBER_RE = re.compile(r"\d+(?:\.\d+)+")
+_LONG_HEX_RE = re.compile(r"\b[0-9a-f]{12,}\b", re.I)
+_TIMESTAMP_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?\b")
+_VERSIONED_PATH_COMPONENT = re.compile(
+    r"^(?:.*?[-_])?v?\d+(?:[._]\d+)*$", re.I)
+_SEMANTIC_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)*")
+_LINE_COMMENT_RE = re.compile(r"//.*$")
+_BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/")
+_COMMON_DIFF_TOKENS = {
+    "const", "else", "false", "for", "if", "int", "new", "null", "return",
+    "static", "true", "void", "while",
+}
+
+
+def _is_version_only_delta(old: str, new: str) -> bool:
+    # Only dotted version numbers, long hashes and timestamps count as
+    # version noise; a bare integer delta (e.g. a security bound) is a
+    # semantic change and must not wash out as metadata.
+    normalize = lambda text: _DOTTED_NUMBER_RE.sub(
+        "<version>", _LONG_HEX_RE.sub("<hash>", _TIMESTAMP_RE.sub("<time>", text)))
+    return normalize(old) == normalize(new)
+
+
+def _version_normalized_paths(path: str) -> set[str]:
+    """Return paths obtainable by dropping explicit version directory names."""
+    parts = path.split("/")
+    return {
+        "/".join(part for index, part in enumerate(parts) if index != drop)
+        for drop in range(len(parts) - 1)
+        if _VERSIONED_PATH_COMPONENT.fullmatch(parts[drop])
+    } - {path}
+
+
+def _changed_diff_lines(patch: str, added: bool) -> list[str]:
+    prefix = "+" if added else "-"
+    return [
+        line[1:].strip() for line in patch.splitlines()
+        if line.startswith(prefix) and not line.startswith((prefix * 3, "---", "+++"))
+    ]
+
+
+def _normalized_code_line(line: str) -> str:
+    return " ".join(line.split())
+
+
+def _semantic_tokens(lines: list[str]) -> set[str]:
+    tokens = {
+        match.group(0)
+        for line in lines
+        for match in _SEMANTIC_TOKEN.finditer(line)
+    }
+    return {token for token in tokens if token.lower() not in _COMMON_DIFF_TOKENS}
+
+
+def _context_diff_lines(patch: str) -> list[str]:
+    return [line[1:].strip() for line in patch.splitlines() if line.startswith(" ")]
+
+
+def _strip_comments(line: str) -> str:
+    return _BLOCK_COMMENT_RE.sub(" ", _LINE_COMMENT_RE.sub("", line))
+
+
+_EVIDENCE_TAG_RE = re.compile(r"\b(?:evidence|tools|controller)=\S+")
+
+
+def _brace_paths(lines: list[str]) -> list[tuple[int, ...]]:
+    """Map each line to the chain of 1-based open-brace line numbers around it.
+
+    Two lines share an execution path only when one chain is a prefix of the
+    other; sibling chains under the same parent are mutually exclusive
+    branches. Braces inside strings can misattribute a path, so callers use
+    this only to falsify claims, never to accept them on faith.
+    """
+    paths: list[tuple[int, ...]] = []
+    stack: list[int] = []
+    for number, line in enumerate(lines, start=1):
+        paths.append(tuple(stack))
+        for character in _strip_comments(line):
+            if character == "{":
+                stack.append(number)
+            elif character == "}" and stack:
+                stack.pop()
+    return paths
+
+
+def _covers_path(mechanism: tuple[int, ...], anchor: tuple[int, ...]) -> bool:
+    return len(mechanism) <= len(anchor) and mechanism == anchor[:len(mechanism)]
+
+
+def _claim_mechanism_tokens(reason: str, hunk_patch: str) -> set[str]:
+    """Identifiers a claim introduces as its equivalent-mechanism evidence."""
+    prose = _EVIDENCE_TAG_RE.sub(" ", reason)
+    known = _semantic_tokens(
+        _changed_diff_lines(hunk_patch, added=True)
+        + _changed_diff_lines(hunk_patch, added=False)
+        + _context_diff_lines(hunk_patch))
+    return {
+        token for token in _semantic_tokens([prose]) - known
+        if ("_" in token or any(char.isupper() for char in token[1:])
+            or len(token) >= 8)
+        and token not in {"implemented", "need_not_ported"}
+    }
+
+
+def _novel_tokens(patch: str) -> set[str]:
+    """Tokens the hunk introduces beyond its own removed and context lines.
+
+    Re-wrapped or re-indented lines contribute only tokens that already exist
+    elsewhere in the hunk, so they cancel out; what remains is the semantic
+    content the hunk actually adds. Returns an empty set for hunks without
+    added lines or without any new token (pure rewraps, version bumps).
+    """
+    added = _changed_diff_lines(patch, added=True)
+    if not added:
+        return set()
+    existing = _changed_diff_lines(patch, added=False) + _context_diff_lines(patch)
+    return (_semantic_tokens([_strip_comments(line) for line in added])
+            - _semantic_tokens([_strip_comments(line) for line in existing]))
 
 
 class AssessmentError(ValueError):
@@ -87,7 +211,8 @@ class AospBackportAgent:
         self._last_audit: dict[str, Any] | None = None
         self._events_swept = 0
         self.record: dict[str, Any] = {"cve": case.cve, "status": "INITIALIZED", "backend": "codex_sdk",
-            "model": model or "codex_config_default", "events": [], "verification_scope": "configured_commands_only",
+            "model": model or "codex_config_default", "events": [],
+            "verification_scope": "configured_commands_only",
             "runtime_security_proven": False,
             "model_execution": "not_run", "impact_decision": "uncertain",
             "source_review": "not_run", "patch_replay": "not_run",
@@ -638,25 +763,52 @@ class AospBackportAgent:
                   f"{', '.join(missing) or 'none'}\n")
 
     def _check_hunk_results(self, response: str,
-                            changed_files: list[str]) -> dict[str, Any]:
-        """Validate the model's HUNK-RESULT declarations against the diff (P1.6).
-
-        Fail-closed (r2 revision 6): a response without any declaration is a
-        failed turn, not a silent pass.
-        """
+                            changed_files: list[str],
+                            candidate_patch: str | None = None) -> dict[str, Any]:
+        """Require a complete, non-contradictory donor-hunk ledger."""
         claims = [{"id": match.group(1), "status": match.group(2), "reason": match.group(3)}
                   for match in _HUNK_RESULT_RE.finditer(response or "")]
+        expected_ids = {hunk["id"] for hunk in self._current_hunks}
+        claimed_ids = [claim["id"] for claim in claims]
+        missing = sorted(expected_ids - set(claimed_ids))
+        duplicates = sorted({item for item in claimed_ids
+                             if claimed_ids.count(item) > 1})
+        unexpected = sorted(set(claimed_ids) - {hunk["id"] for hunk in self._current_hunks})
+        coverage = {"expected": sorted(expected_ids), "claimed": sorted(set(claimed_ids)),
+                    "missing": missing, "duplicate": duplicates, "unexpected": unexpected}
         if not claims:
-            return {"ok": False, "claims": [], "contradictions": [],
+            return {"ok": False, "claims": [], "contradictions": [], "coverage": coverage,
                     "missing_declaration": True,
                     "feedback": ("Your reply contained no HUNK-RESULT declaration. End your "
                                  "turn with one line per donor hunk:\n"
-                                 "HUNK-RESULT <hunk-id> implemented|need_not_ported <reason>")}
+                                 "HUNK-RESULT <hunk-id> implemented|need_not_ported "
+                                 "evidence=<category> <reason>")}
+
         hunks = {hunk["id"]: hunk for hunk in self._current_hunks}
-        contradictions = []
+        contradictions: list[str] = []
         for claim in claims:
             if claim["id"] not in hunks:
                 contradictions.append(f"unknown hunk id: {claim['id']}")
+            elif claim["status"] == "need_not_ported":
+                evidence = self._exclusion_evidence(claim, hunks.get(claim["id"]))
+                claim["reason"] = evidence.get("reason", claim["reason"])
+                if not evidence["ok"]:
+                    contradictions.append(f"{claim['id']}: {evidence['error']}")
+                elif evidence.get("category") in ("semantic_equivalence",
+                                                  "already_present"):
+                    falsified = self._falsify_exclusion_against_target(
+                        hunks[claim["id"]], claim, evidence["category"])
+                    if falsified:
+                        claim["falsified_exclusion"] = True
+                        contradictions.append(f"{claim['id']}: {falsified}")
+            else:
+                target_evidence = self._implemented_hunk_evidence(
+                    hunks[claim["id"]], candidate_patch)
+                claim["target_evidence"] = target_evidence
+                if target_evidence["required"] and not target_evidence["ok"]:
+                    contradictions.append(
+                        f"{claim['id']}: {target_evidence['error']}")
+
         by_path: dict[str, list[str]] = {}
         for claim in claims:
             hunk = hunks.get(claim["id"])
@@ -665,26 +817,394 @@ class AospBackportAgent:
         changed = set(changed_files)
         allowlist = set(self.case.files)
         for path, statuses in sorted(by_path.items()):
-            if "implemented" in statuses and path not in changed:
-                if path in allowlist:
-                    contradictions.append(
-                        f"{path}: declared implemented but the final diff does not touch it")
-                # A donor path outside the allowlist does not exist at the
-                # target baseline; its fix content can only be semantically
-                # ported into a different allowlisted file (CVE-2025-32348:
-                # "Adapted in ActivityStarter..."). The path-literal audit
-                # cannot verify that mapping — the case's validation checks
-                # (source contracts, module build) carry the semantic burden.
-            if statuses and all(s == "need_not_ported" for s in statuses) and path in changed:
+            donor_targets = self._donor_targets(path)
+            if ("implemented" in statuses and donor_targets
+                    and not donor_targets.intersection(changed)
+                    and (path in allowlist or donor_targets.intersection(allowlist))):
+                contradictions.append(
+                    f"{path}: declared implemented but no mapped target is changed")
+            if (statuses and all(status == "need_not_ported" for status in statuses)
+                    and path in changed):
                 contradictions.append(
                     f"{path}: declared need_not_ported but the final diff modifies it")
+
+        if missing:
+            contradictions.append("missing HUNK-RESULT declarations: " + ", ".join(missing))
+        if duplicates:
+            contradictions.append("duplicate HUNK-RESULT declarations: " + ", ".join(duplicates))
         ok = not contradictions
         return {"ok": ok, "claims": claims, "contradictions": contradictions,
-                "missing_declaration": False,
+                "coverage": coverage, "missing_declaration": False,
                 "feedback": None if ok else
-                ("Your HUNK-RESULT claims contradict the exported diff:\n- "
+                ("Your HUNK-RESULT ledger contradicts the supplied donor hunks or exported diff:\n- "
                  + "\n- ".join(contradictions)
-                 + "\nReconcile the declarations with the actual diff in your next turn.")}
+                 + "\nProvide exactly one evidence-backed declaration for every donor hunk.")}
+
+    def _implemented_hunk_evidence(self, hunk: dict[str, Any],
+                                   candidate_patch: str | None) -> dict[str, Any]:
+        targets = sorted(self._donor_targets(hunk.get("path", "")))
+        result = {"required": bool(targets), "targets": targets,
+                  "ok": not targets, "match": None}
+        if not targets:
+            return result
+        if candidate_patch is None:
+            result["error"] = "candidate patch evidence is unavailable"
+            return result
+        try:
+            candidates = split_hunks(candidate_patch)
+        except ValueError as exc:
+            result["error"] = f"invalid candidate patch: {exc}"
+            return result
+
+        by_path: dict[str, list[dict[str, Any]]] = {}
+        for candidate in candidates:
+            by_path.setdefault(candidate["path"], []).append(candidate)
+        donor_additions = _changed_diff_lines(hunk.get("patch", ""), added=True)
+        expected_lines = donor_additions or _changed_diff_lines(
+            hunk.get("patch", ""), added=False)
+        expected_lines = [line for line in expected_lines if line]
+        for target in targets:
+            target_hunks = by_path.get(target, [])
+            if not target_hunks:
+                continue
+            target_lines: list[str] = []
+            for target_hunk in target_hunks:
+                target_lines.extend(_changed_diff_lines(
+                    target_hunk.get("patch", ""), added=bool(donor_additions)))
+            target_lines = [line for line in target_lines if line]
+            if not expected_lines:
+                result.update(ok=True, match=f"changed target hunk: {target}")
+                return result
+
+            normalized_target = {
+                _normalized_code_line(line) for line in target_lines
+            }
+            exact = sorted(
+                line for line in expected_lines
+                if _normalized_code_line(line) in normalized_target
+            )
+            if exact:
+                result.update(
+                    ok=True, match=f"exact normalized line in {target}: {exact[0]}")
+                return result
+
+            donor_tokens = _semantic_tokens(
+                [_strip_comments(line) for line in expected_lines])
+            target_tokens = _semantic_tokens(
+                [_strip_comments(line) for line in target_lines])
+            overlap = donor_tokens & target_tokens
+            ratio = len(overlap) / len(donor_tokens) if donor_tokens else 0.0
+            if donor_tokens and ratio >= 0.5:
+                result.update(
+                    ok=True,
+                    match=(f"token evidence in {target}: "
+                           + ", ".join(sorted(overlap)[:8])))
+                return result
+
+            if donor_additions:
+                novel = _novel_tokens(hunk.get("patch", ""))
+                if novel:
+                    target_code_tokens = _semantic_tokens(
+                        [_strip_comments(line) for line in target_lines])
+                    if novel <= target_code_tokens:
+                        result.update(
+                            ok=True,
+                            match=(f"novel tokens in {target}: "
+                                   + ", ".join(sorted(novel)[:8])))
+                        return result
+                else:
+                    result.update(
+                        ok=True,
+                        match=(f"no novel tokens in rewrap-only donor hunk; "
+                               f"target changed: {target}"))
+                    return result
+        result["error"] = "no mapped target semantic evidence"
+        return result
+
+    def _exclusion_evidence(self, claim: dict[str, Any],
+                            hunk: dict[str, Any] | None) -> dict[str, Any]:
+        reason = claim.get("reason") or ""
+        category_match = re.search(r"\bevidence=([a-z_]+)", reason)
+        if not category_match:
+            return {"ok": False, "error": "need_not_ported requires evidence=<category>"}
+        category = category_match.group(1)
+        allowed = {"metadata_only", "already_present", "no_target_counterpart", "semantic_equivalence"}
+        if category not in allowed:
+            return {"ok": False,
+                    "error": f"unsupported exclusion evidence category: {category}"}
+        if hunk is None:
+            return {"ok": False, "error": "unknown donor hunk"}
+        if category == "metadata_only":
+            if not self._is_metadata_hunk(hunk):
+                return {"ok": False,
+                        "error": "metadata_only does not match the donor hunk"}
+            return {"ok": True, "category": category, "tool_uids": []}
+        if category == "no_target_counterpart":
+            targets = self._donor_targets(hunk.get("path", ""))
+            if targets:
+                return {"ok": False, "category": category,
+                        "error": ("no_target_counterpart is false: the controller maps "
+                                  f"donor path {hunk.get('path', '')} to target file(s) "
+                                  f"{', '.join(sorted(targets))}. Port the hunk, or exclude "
+                                  "it with already_present/semantic_equivalence backed by "
+                                  "target tool evidence (metadata_only for metadata hunks)")}
+            application = hunk.get("application_check", {})
+            application_error = str(application.get("stderr") or application.get("stdout") or "")
+            if "does not exist in index" in application_error:
+                reason = re.sub(rf"\bevidence={category}\b",
+                                f"evidence={category} controller=missing_target_path",
+                                reason, count=1)
+                return {"ok": True, "category": category, "tool_uids": [],
+                        "controller_evidence": "missing_target_path", "reason": reason}
+
+        tools_match = re.search(r"\btools=([0-9a-f]+(?:\+[0-9a-f]+)*)\b", reason)
+        usage = self._tool_usage()
+        relevant_uids = [uid for uid, record in usage.items()
+                         if record.get("returncode") == 0
+                         and self._tool_supports_hunk(record, hunk)]
+        if not tools_match:
+            if relevant_uids:
+                verified = relevant_uids[-1:]
+                reason = re.sub(rf"\bevidence={category}\b",
+                                f"evidence={category} tools={'+'.join(verified)}",
+                                reason, count=1)
+                return {"ok": True, "category": category, "tool_uids": verified,
+                        "reason": reason}
+            return {"ok": False,
+                    "error": f"{category} requires tools=<uid>[+<uid>] from controlled tools"}
+
+        tool_uids = tools_match.group(1).split("+")
+        verified = [uid for uid in tool_uids
+                    if uid in usage
+                    and usage[uid].get("returncode") == 0
+                    and self._tool_supports_hunk(usage[uid], hunk)]
+        if verified:
+            unique_verified = list(dict.fromkeys(verified))
+            start, end = tools_match.span()
+            reason = reason[:start] + "tools=" + "+".join(unique_verified) + reason[end:]
+            return {"ok": True, "category": category, "tool_uids": unique_verified,
+                    "reason": reason}
+
+        if relevant_uids:
+            unique_verified = list(dict.fromkeys(relevant_uids[-1:]))
+            start, end = tools_match.span()
+            reason = reason[:start] + "tools=" + "+".join(unique_verified) + reason[end:]
+            return {"ok": True, "category": category, "tool_uids": unique_verified,
+                    "reason": reason}
+
+        available = ", ".join(relevant_uids) or "none"
+        for uid in tool_uids:
+            record = usage.get(uid)
+            if record is None or record.get("returncode") != 0:
+                return {"ok": False,
+                        "error": (f"missing or unsuccessful tool evidence {uid}; "
+                                  f"available relevant successful UIDs: {available}")}
+            if not self._tool_supports_hunk(record, hunk):
+                return {"ok": False,
+                        "error": (f"tool evidence {uid} is not relevant to donor hunk "
+                                  f"{hunk['id']}; available relevant successful UIDs: "
+                                  f"{available}")}
+        return {"ok": False,
+                "error": f"no successful relevant tool evidence; available UIDs: {available}"}
+
+    def _tool_usage(self) -> dict[str, dict[str, Any]]:
+        path = self.run_dir / "tool-usage.jsonl"
+        records: dict[str, dict[str, Any]] = {}
+        if not path.is_file():
+            return records
+        for line in path.read_text(errors="replace").splitlines():
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict) and record.get("uid"):
+                records[str(record["uid"])] = record
+        return records
+
+    def _tool_supports_hunk(self, record: dict[str, Any], hunk: dict[str, Any]) -> bool:
+        command = record.get("cmd")
+        arguments = record.get("args") or {}
+        if command == "hunk-history":
+            return arguments.get("hunk_id") == hunk["id"]
+        if command == "show-commit":
+            return arguments.get("hunk_id") == hunk["id"]
+        if command == "view-code":
+            relevant_paths = self._donor_targets(hunk["path"]) | {hunk["path"]}
+            return (arguments.get("repo") == "target"
+                    and arguments.get("path") in relevant_paths)
+        if command == "locate-symbol":
+            symbol = arguments.get("symbol")
+            return (arguments.get("repo") == "target"
+                    and isinstance(symbol, str) and symbol in hunk.get("patch", ""))
+        return False
+
+    def _is_metadata_hunk(self, hunk: dict[str, Any]) -> bool:
+        path = hunk.get("path") or ""
+        if _METADATA_PATH_RE.search(path):
+            return True
+        patch_lines = hunk.get("patch", "").splitlines()
+        removed = [line[1:] for line in patch_lines
+                   if line.startswith("-") and not line.startswith("---")]
+        added = [line[1:] for line in patch_lines
+                 if line.startswith("+") and not line.startswith("+++")]
+        changed_lines = removed + added
+        if not changed_lines:
+            return False
+        if all(_METADATA_LINE_RE.search(line) for line in changed_lines):
+            return True
+        return (len(removed) == len(added) and bool(removed)
+                and all(_is_version_only_delta(old, new)
+                        for old, new in zip(removed, added)))
+
+    def _donor_targets(self, donor_path: str) -> set[str]:
+        allowed = set(self.case.files)
+        targets = {donor_path} & allowed
+        normalized = _version_normalized_paths(donor_path) & allowed
+        if len(normalized) == 1:
+            targets.update(normalized)
+        return targets
+
+    def _target_baseline_lines(self, path: str) -> list[str] | None:
+        blob = self._git("show", f"{self.case.target_commit}:{path}",
+                         cwd=self.worktree, check=False)
+        if blob.returncode != 0:
+            return None
+        return blob.stdout.splitlines()
+
+    def _target_baseline_analysis(self, path: str) -> dict[str, Any] | None:
+        """Comment-stripped lines, brace paths and a token-occurrence index.
+
+        Cached per path: the target commit is immutable for the run, and the
+        ledger re-checks the same mapped files for every exclusion claim and
+        every retry.
+        """
+        cache = getattr(self, "_target_analysis_cache", None)
+        if cache is None:
+            cache = self._target_analysis_cache = {}
+        if path in cache:
+            return cache[path]
+        raw = self._target_baseline_lines(path)
+        if raw is None:
+            cache[path] = None
+            return None
+        code = [_strip_comments(line) for line in raw]
+        analysis = {
+            "raw": raw,
+            "code": code,
+            "paths": _brace_paths(raw),
+            "normalized": [_normalized_code_line(line) for line in code],
+            "occurrences": {},
+        }
+        cache[path] = analysis
+        return analysis
+
+    def _token_occurrences(self, analysis: dict[str, Any], token: str) -> list[int]:
+        occurrences = analysis["occurrences"]
+        if token not in occurrences:
+            occurrences[token] = [
+                index for index, line in enumerate(analysis["code"])
+                if re.search(rf"\b{re.escape(token)}\b", line)]
+        return occurrences[token]
+
+    def _falsify_exclusion_against_target(self, hunk: dict[str, Any],
+                                          claim: dict[str, Any],
+                                          category: str) -> str | None:
+        """Falsify target-side exclusion claims the controller can check itself.
+
+        When the donor hunk's pre-change line still exists in a mapped target
+        file the anchor is present: a semantic_equivalence claim must rest on a
+        mechanism that executes on the anchor's path, and an already_present
+        claim must find the hunk's added lines in the target. Claims about code
+        the target does not contain stay with the tool-UID evidence checks.
+        """
+        targets = sorted(self._donor_targets(hunk.get("path", "")))
+        if not targets:
+            return None
+        patch = hunk.get("patch", "")
+        anchors = {line for line in (_normalized_code_line(_strip_comments(item))
+                                     for item in
+                                     _changed_diff_lines(patch, added=False))
+                   if line}
+        if not anchors:
+            return None
+        additions = {line for line in (_normalized_code_line(_strip_comments(item))
+                                       for item in
+                                       _changed_diff_lines(patch, added=True))
+                     if line}
+
+        if category == "already_present":
+            for target in targets:
+                analysis = self._target_baseline_analysis(target)
+                if analysis is None:
+                    continue
+                normalized = analysis["normalized"]
+                anchor_hits = [index for index, line in enumerate(normalized)
+                               if line in anchors]
+                if not anchor_hits:
+                    continue
+                addition_hits = [index for index, line in enumerate(normalized)
+                                 if line in additions]
+                paths = analysis["paths"]
+                for index in anchor_hits:
+                    anchor_path = paths[index]
+                    if not anchor_path:
+                        continue
+                    if not any(paths[hit] and paths[hit][0] == anchor_path[0]
+                               for hit in addition_hits):
+                        return ("already_present is false: the hunk's pre-change "
+                                f"line still exists unchanged at {target}:{index + 1} "
+                                "and its added lines occur only outside that "
+                                "function; port the hunk at this site")
+            return None
+
+        mechanisms = _claim_mechanism_tokens(claim.get("reason", ""), patch)
+        strongest: tuple[int, str] | None = None
+        for target in targets:
+            analysis = self._target_baseline_analysis(target)
+            if analysis is None:
+                continue
+            paths = analysis["paths"]
+            anchor_indexes = [index for index, line
+                              in enumerate(analysis["normalized"])
+                              if line in anchors]
+            for index in anchor_indexes:
+                anchor_path = paths[index]
+                if not anchor_path:
+                    continue
+                for token in mechanisms:
+                    for hit in self._token_occurrences(analysis, token):
+                        hit_path = paths[hit]
+                        if not hit_path or hit_path[0] != anchor_path[0]:
+                            continue
+                        if _covers_path(hit_path, anchor_path):
+                            return None
+                        message = (f"semantic_equivalence is false: cited mechanism "
+                                   f"{token} at {target}:{hit + 1} sits in a branch "
+                                   f"that cannot execute on the anchor's path "
+                                   f"(anchor at {target}:{index + 1}); port the hunk "
+                                   "or cite a mechanism on the anchor's path")
+                        if strongest is None or strongest[0] < 2:
+                            strongest = (2, message)
+            if anchor_indexes:
+                absent = sorted(token for token in mechanisms
+                                if not self._token_occurrences(analysis, token))
+                if strongest is None:
+                    if not mechanisms:
+                        strongest = (1, "semantic_equivalence is unsupported: the "
+                                        "claim names no equivalent target mechanism "
+                                        f"while the anchor line still exists unchanged "
+                                        f"in {target}")
+                    elif absent:
+                        strongest = (1, f"semantic_equivalence is unsupported: cited "
+                                        f"mechanism(s) {', '.join(absent)} do not occur "
+                                        f"in {target}, whose anchor line still exists "
+                                        "unchanged")
+                    else:
+                        strongest = (1, "semantic_equivalence is unsupported: no cited "
+                                        "mechanism occurs inside the anchor's function "
+                                        f"in {target}; the anchor line still exists "
+                                        "unchanged")
+        return strongest[1] if strongest else None
 
     def _codex_workflow(self, inspection: dict[str, Any], verify: bool, max_attempts: int,
                         mechanical: bool = True, impact_only: bool = False) -> None:
@@ -805,6 +1325,7 @@ class AospBackportAgent:
                            + f"\nThe controller will run {len(self.case.validation)} independent configured checks "
                            "after your edits. Their implementation is not part of the model input.")
             self.record["attempts"] = []
+            self.record.setdefault("attempt_verifications", {})
             diagnosis_json: dict[str, Any] | None = None
             claim_feedback: str | None = None
             failing_stages: list[str] = []
@@ -841,9 +1362,27 @@ class AospBackportAgent:
                 self.record["attempts"][-1]["patch_sha256"] = self.record["patch_sha256"]
                 previous_patch_shas.append(self.record["patch_sha256"])
                 if not patch.strip():
-                    raise RuntimeError("AFFECTED assessment produced no actual patch")
-                claims = self._check_hunk_results(result.get("final_response", ""),
-                                                  self._last_audit["changed_files"])
+                    self.record["status"] = "VALIDATION_FAILED"
+                    self._event("empty_patch", attempt=attempt,
+                                allowlist=list(self.case.files))
+                    diagnosis_json = {
+                        "summary": "The AFFECTED assessment produced an empty patch.",
+                        "allowlist": list(self.case.files),
+                        "required_action": (
+                            "Modify at least one allowlisted target file with the smallest "
+                            "semantically complete security fix; do not submit another "
+                            "no-change response."),
+                    }
+                    claim_feedback = None
+                    failing_stages = []
+                    self.record["attempt_verifications"][str(attempt)] = {
+                        "status": "NOT_RUN", "blocked_by": "EMPTY_PATCH",
+                        "patch_sha256": self.record["patch_sha256"], "commands": []}
+                    self.record["final_verification"] = self.record["attempt_verifications"][str(attempt)]
+                    continue
+                claims = self._check_hunk_results(
+                    result.get("final_response", ""),
+                    self._last_audit["changed_files"], patch)
                 self.record["hunk_results"] = claims["claims"]
                 if not claims["ok"]:
                     # P1.6 / r2 revision 6: contradicted or missing declarations
@@ -852,6 +1391,10 @@ class AospBackportAgent:
                     self._event("hunk_result_check_failed",
                                 contradictions=claims["contradictions"],
                                 missing_declaration=claims["missing_declaration"])
+                    self.record["attempt_verifications"][str(attempt)] = {
+                        "status": "NOT_RUN", "blocked_by": "HUNK_LEDGER",
+                        "patch_sha256": self.record["patch_sha256"], "commands": []}
+                    self.record["final_verification"] = self.record["attempt_verifications"][str(attempt)]
                     claim_feedback = claims["feedback"]
                     diagnosis_json = None
                     continue
@@ -860,6 +1403,7 @@ class AospBackportAgent:
                     self.record.update(status="PATCH_UNVERIFIED", final_verification={"status": "NOT_REQUESTED", "commands": []}); return
                 verification = self.verify()
                 self.record["final_verification"] = verification
+                self.record["attempt_verifications"][str(attempt)] = verification
                 if verification["status"] == "PASS":
                     self.record["status"] = "VALIDATED"
                     # 功能二：修复后业务影响评估（doc E 类）。补丁验证通过后，
@@ -1068,7 +1612,8 @@ class AospBackportAgent:
                                               "passed_stages": sorted(
                                                   stage for stage, outcome in stages.items()
                                                   if outcome == "PASS")}
-        result = {"commands": results, "stages": stages, "status": status, "scope": "configured_commands_only",
+        result = {"commands": results, "stages": stages, "status": status,
+                  "scope": "configured_commands_only",
                   "patch_sha256": self.record.get("patch_sha256"),
                   "skipped_stages": sorted(passed_stages & set(stages))}
         for layer in ("source_extracted_jvm", "android_module_build", "android_runtime"):

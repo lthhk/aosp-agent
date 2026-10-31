@@ -604,7 +604,24 @@ version metadata. Run only validation commands listed by the orchestrator. Never
 a clean diff, or a successful git apply alone proves runtime security or product reachability.
 
 End your turn with one line per donor hunk you considered:
-HUNK-RESULT <hunk-id> implemented|need_not_ported <one-line reason>
+HUNK-RESULT <hunk-id> implemented|need_not_ported evidence=<category> <one-line reason>
+
+Every donor hunk shown in the applicability input must have exactly one declaration.
+For need_not_ported exclusions, evidence must be one of: metadata_only, already_present, no_target_counterpart,
+or semantic_equivalence. Every category except metadata_only must also cite at least
+one successful controlled-tool UID as `tools=<uid>[+<uid>]`; cite a target view/locate
+UID for already_present or semantic_equivalence. semantic_equivalence must name the
+identifier(s) of the equivalent target mechanism and that mechanism must execute on the
+path through the anchor site (the controller falsifies the claim against the target
+baseline: mechanisms in mutually exclusive branches or other functions are rejected). no_target_counterpart is valid only
+when the controller cannot map the donor path to any allowlisted target file — the
+claim is rejected outright when a normalized target file exists, so then port the
+hunk or use another category. When the donor path is genuinely unmapped and its
+applicability check already reported absence, cite `controller=missing_target_path`;
+otherwise cite a hunk-history/show-commit UID.
+The controller verifies UID success and hunk relevance; one verified UID is sufficient,
+and uncertain supplemental UIDs must not be invented. An
+unsupported statement such as “outside CVE scope” is not evidence.
 followed by a short summary of changed files, the invariant preserved, evidence-based assumptions,
 checks actually executed and their outcomes, and remaining validation limits.
 """

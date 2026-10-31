@@ -37,6 +37,9 @@ class FakeHandle:
             # Truncation: string left open — repair must decline.
             "truncated": '{"verdict": "uncl',
             "broken_json": '{"status": "AFFECTED", "evidence": []',
+            "schema_envelope": (
+                '{"type":"object","additionalProperties":false,'
+                '"properties":{"verdict":"ready"}}'),
         }
         text = texts.get(self.mode, texts["completed"])
         item = {"type": "agentMessage", "phase": "final_answer", "text": text}
@@ -256,6 +259,18 @@ class RuntimeTest(unittest.TestCase):
         self.assertNotIn("json_repaired", result)
         self.assertEqual(len(fake.thread.calls), 3)
         self.assertFalse(any(event.get("event") == "output_json_repaired" for event in events))
+
+    def test_schema_envelope_is_unwrapped_without_model_roundtrip(self):
+        schema = {
+            "type": "object", "required": ["verdict"],
+            "properties": {"verdict": {"type": "string"}},
+            "additionalProperties": False,
+        }
+        result, fake, events = self.run_fake("schema_envelope", schema=schema)
+        self.assertEqual(result["output"], {"verdict": "ready"})
+        self.assertTrue(result.get("schema_envelope_unwrapped"))
+        self.assertEqual(len(fake.thread.calls), 2)
+        self.assertTrue(any(event.get("event") == "output_schema_envelope_unwrapped" for event in events))
 
 
 if __name__ == "__main__":

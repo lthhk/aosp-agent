@@ -78,6 +78,20 @@ def _remove_wire_only_nulls(value: Any, schema: Any) -> Any:
     return cleaned
 
 
+def _unwrap_schema_envelope(output: Any, output_schema: Any) -> Any | None:
+    """Return a model result accidentally nested in a JSON-Schema envelope."""
+    if not isinstance(output, dict) or not isinstance(output_schema, dict):
+        return None
+    if output_schema.get("type") != "object" or set(output) != {
+            "type", "additionalProperties", "properties"}:
+        return None
+    if (output.get("type") != "object"
+            or output.get("additionalProperties") is not False
+            or not isinstance(output.get("properties"), dict)):
+        return None
+    return output["properties"]
+
+
 class CodexRuntime:
     """One Codex conversation with explicit sandbox changes and durable events.
 
@@ -261,7 +275,16 @@ class CodexRuntime:
             try:
                 validator.validate(output)
             except Exception as exc:
-                return None, f"{type(exc).__name__}: {exc}"[:500]
+                unwrapped = _unwrap_schema_envelope(output, output_schema)
+                if unwrapped is None:
+                    return None, f"{type(exc).__name__}: {exc}"[:500]
+                try:
+                    validator.validate(unwrapped)
+                except Exception:
+                    return None, f"{type(exc).__name__}: {exc}"[:500]
+                self._log("output_schema_envelope_unwrapped", thread_id=self._thread.id)
+                result["schema_envelope_unwrapped"] = True
+                output = unwrapped
         return output, None
 
 

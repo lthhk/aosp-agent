@@ -33,6 +33,14 @@ SDK 执行层为 `sdk_runtime.py`，使用 `AsyncCodex`、官方 streaming turn�
 5. 仅 AFFECTED 进入迁移。SDK 在独立工作树修改允许文件；每回合后审计路径、HEAD、符号链接和原始 checkout。
 6. 导出暂存、未暂存及新增测试文件，在新的干净 detached worktree 中独立重放补丁；执行控制器持有的分层验证命令并按失败反馈修订。
 
+迁移回合必须为输入的每个 donor hunk 提供恰好一条 `HUNK-RESULT` 声明。排除
+hunk 不能只写“outside scope”，必须携带受控证据类别。该账本由控制器根据
+donor diff 统一生成，不依赖按 CVE 手工配置的必需 hunk 白名单。
+对于仅差一个显式版本目录的 donor 路径，控制器会在结果唯一命中目标 allowlist
+时建立路径映射；多候选或无候选均按未映射处理。声明 implemented 的映射 hunk
+必须在最终候选 diff 的对应目标文件中提供语义证据（归一化行或标识符重合），
+不能只因为该文件发生了其他修改而通过。
+
 `dataset/cases/` 是运行事实；`dataset/oracles/` 和历史人工补丁只供离线评价。模型输入不包含参考影响结论、迁移方案或验证实现。源码引用检查能证明引用真实，不能自动证明模型推理正确或所有产品可达性。
 
 ## 状态与证据

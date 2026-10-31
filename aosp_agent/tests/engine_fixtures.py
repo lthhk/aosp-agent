@@ -144,11 +144,13 @@ class ScriptedRuntime:
     def __init__(self, assessment: dict[str, Any] | str,
                  edits: list[Callable[[Path], None] | None] | None = None,
                  impact_edit: Callable[[Path], None] | None = None,
-                 patch_response: str | None = None):
+                 patch_response: str | None = None,
+                 patch_responses: list[str | None] | None = None):
         self.assessment = assessment
         self.edits = edits or []
         self.impact_edit = impact_edit
         self.patch_response = patch_response
+        self.patch_responses = patch_responses
         self.calls: list[dict[str, Any]] = []
         self.factory_options: dict[str, Any] = {}
         self.worktree: Path | None = None
@@ -207,9 +209,12 @@ class ScriptedRuntime:
                 edit(self.worktree)
             # The backport contract requires a per-hunk declaration; the
             # fixture's donor diff has one hunk (counter.py -> f001-h001).
-            response = (self.patch_response or
-                        "Applied the proposed adaptation; use orchestrator validation results.\n"
-                        "HUNK-RESULT f001-h001 implemented adapted the donor fix to the target baseline.")
+            default_response = ("Applied the proposed adaptation; use orchestrator validation results.\n"
+                                "HUNK-RESULT f001-h001 implemented adapted the donor fix to the target baseline.")
+            if self.patch_responses is not None:
+                response = self.patch_responses[self._write_index - 1] or default_response
+            else:
+                response = self.patch_response or default_response
         output = self.assessment if len(self.calls) == 1 and isinstance(self.assessment, dict) else response
         return {"status": "completed", "final_response": response, "output": output,
                 "thread_id": "fixture-thread", "turn_id": f"fixture-turn-{len(self.calls)}",

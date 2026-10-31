@@ -129,6 +129,11 @@ def verification_diagnosis(checks: list[dict[str, Any]]) -> dict[str, Any]:
                              if not item.get("exists")]
         entry = {"stage": stage, "returncode": code, "error_lines": error_lines,
                  "missing_artifacts": missing_artifacts, "symbols": symbols}
+        for key in ("type", "file", "pattern", "matching", "count", "expected_count",
+                    "min_count", "max_count", "baseline_count", "required_delta",
+                    "matches", "counts", "missing_dependencies"):
+            if key in check:
+                entry[key] = check[key]
         if code:
             entry["argv"] = argv
         if code and not error_lines and not missing_artifacts:
