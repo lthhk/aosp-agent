@@ -37,6 +37,13 @@ class FakeHandle:
             # Truncation: string left open — repair must decline.
             "truncated": '{"verdict": "uncl',
             "broken_json": '{"status": "AFFECTED", "evidence": []',
+            # A complete JSON object followed by trailing prose (the
+            # seven-410ea70/CVE-2025-48533 correction-turn signature:
+            # "Extra data: line 1 column 3697").
+            "json_plus_trailing": '{"verdict":"ready"} trailing prose the model appended',
+            # Two complete JSON documents: the second may be the model's
+            # corrected answer, so prefix recovery must decline.
+            "two_documents": '{"verdict":"draft"} {"verdict":"ready"}',
             "schema_envelope": (
                 '{"type":"object","additionalProperties":false,'
                 '"properties":{"verdict":"ready"}}'),
@@ -65,6 +72,8 @@ class FakeThread:
             mode = "broken_json" if len(self.calls) == 1 else "completed"
         elif mode == "trunc_then_ok":
             mode = "truncated" if len(self.calls) == 1 else "completed"
+        elif mode == "two_docs_then_ok":
+            mode = "two_documents" if len(self.calls) == 1 else "completed"
         self.handle = FakeHandle(mode)
         return self.handle
 
@@ -271,6 +280,38 @@ class RuntimeTest(unittest.TestCase):
         self.assertTrue(result.get("schema_envelope_unwrapped"))
         self.assertEqual(len(fake.thread.calls), 2)
         self.assertTrue(any(event.get("event") == "output_schema_envelope_unwrapped" for event in events))
+
+    def test_trailing_content_after_json_is_recovered_in_place(self):
+        # seven-410ea70/CVE-2025-48533 lesson: one complete JSON object plus
+        # trailing prose must be recovered from the prefix without a
+        # corrective roundtrip; the schema validator still gates the value.
+        schema = {
+            "type": "object", "required": ["verdict"],
+            "properties": {"verdict": {"type": "string"}},
+            "additionalProperties": False,
+        }
+        result, fake, events = self.run_fake("json_plus_trailing", schema=schema)
+        self.assertEqual(result["output"], {"verdict": "ready"})
+        self.assertTrue(result.get("json_prefix_recovered"))
+        self.assertEqual(len(fake.thread.calls), 2)
+        self.assertTrue(any(event.get("event") == "output_json_prefix_recovered" for event in events))
+
+    def test_second_json_document_blocks_prefix_recovery(self):
+        # Two complete JSON documents: the dropped second document may be the
+        # model's corrected answer, so recovery must decline and the
+        # corrective re-ask resolves it. 3 turns = two documents + corrective
+        # + the plain trailing run's arithmetic from the truncation test.
+        schema = {
+            "type": "object", "required": ["verdict"],
+            "properties": {"verdict": {"type": "string"}},
+            "additionalProperties": False,
+        }
+        result, fake, events = self.run_fake("two_docs_then_ok", schema=schema)
+        self.assertEqual(result["output"], {"verdict": "ready"})
+        self.assertNotIn("json_prefix_recovered", result)
+        self.assertEqual(len(fake.thread.calls), 3)
+        self.assertFalse(any(event.get("event") == "output_json_prefix_recovered"
+                             for event in events))
 
 
 if __name__ == "__main__":

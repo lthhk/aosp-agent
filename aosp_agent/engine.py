@@ -131,6 +131,49 @@ def _claim_mechanism_tokens(reason: str, hunk_patch: str) -> set[str]:
     }
 
 
+_PLATFORM_API_PREFIXES = (
+    "java.", "javax.", "sun.", "libcore.", "kotlin.", "kotlinx.",
+    "org.json.", "org.w3c.dom.", "org.w3c.sax.", "org.xml.", "org.ietf.",
+)
+_PLATFORM_FQCN_RE = re.compile(
+    r"(?:java|javax|sun|libcore|kotlin|kotlinx|org\.json|org\.w3c\.dom|"
+    r"org\.w3c\.sax|org\.xml|org\.ietf)\.[A-Za-z_][A-Za-z0-9_]*"
+    r"(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+_LIBC_SYMBOLS = frozenset({
+    "memcpy", "memmove", "memset", "memcmp", "strlen", "strcpy", "strncpy",
+    "strncmp", "strcmp", "strchr", "strrchr", "strstr", "strtol", "strtoul",
+    "atoi", "atol", "snprintf", "sprintf", "printf", "fprintf", "malloc",
+    "calloc", "realloc", "free", "open", "close", "read", "write", "lseek",
+    "fopen", "fclose", "fread", "fwrite", "exit", "abort", "getenv",
+    "qsort", "bsearch",
+})
+
+
+def _is_platform_semantic_api(api: str) -> bool:
+    """True for documented standard-library semantics that live outside both
+    repositories and therefore cannot differ between donor and target.
+
+    Repository-defined behavior (anything implemented under the donor or
+    target checkouts, e.g. android.* framework classes) never qualifies;
+    it must be cited as evidence or declared as an external assumption.
+    """
+    name = (api or "").strip()
+    return bool(_PLATFORM_FQCN_RE.fullmatch(name)) or name in _LIBC_SYMBOLS
+
+
+def _is_repo_implemented_platform_api(api: str, repository_roots: set[str]) -> bool:
+    """True when a repository under analysis implements the api itself.
+
+    libcore implements the Java platform namespaces and bionic the libc
+    symbols; for those repositories the semantics live inside the audited
+    code, are citable as evidence, and may be exactly what the donor fix
+    changes — they must not be asserted from memory.
+    """
+    name = (api or "").strip()
+    return (("libcore" in repository_roots and name.startswith(_PLATFORM_API_PREFIXES))
+            or ("bionic" in repository_roots and name in _LIBC_SYMBOLS))
+
+
 def _novel_tokens(patch: str) -> set[str]:
     """Tokens the hunk introduces beyond its own removed and context lines.
 
@@ -589,8 +632,52 @@ class AospBackportAgent:
         assumptions = causal.get("external_behavior_assumptions", [])
         if assumptions:
             raise AssessmentError(
-                "AFFECTED cannot depend on external API behavior assumptions; use UNKNOWN, "
-                "or NOT_AFFECTED only if the donor-defined faulty data flow is affirmatively absent")
+                "AFFECTED cannot rest on uncited repository/framework behavior: cite the "
+                "decisive behavior in evidence (documented standard-library semantics that "
+                "do not vary between donor and target belong in platform_semantics with "
+                "the relying target call site); answer UNKNOWN only when a material step "
+                "is genuinely unresolved by available evidence")
+        repository = getattr(getattr(self, "case", None), "repository", "") or ""
+        repository_roots = {repository.split("/", 1)[0]} - {""}
+        causal_anchor_indices = (set(causal.get("target_fault_evidence") or [])
+                                 | set(causal.get("target_harm_evidence") or []))
+        for item in causal.get("platform_semantics") or []:
+            api = str(item.get("api", ""))
+            if not _is_platform_semantic_api(api):
+                raise AssessmentError(
+                    f"platform_semantics entry {api!r} is not a standard-library/platform "
+                    "API; repository-defined behavior must be cited as evidence or "
+                    "declared in external_behavior_assumptions")
+            if _is_repo_implemented_platform_api(api, repository_roots):
+                raise AssessmentError(
+                    f"platform_semantics entry {api!r} is implemented by the repository "
+                    "under analysis; cite its behavior as evidence instead of asserting "
+                    "it from memory")
+            indices = item.get("relied_at_evidence") or []
+            if (not indices or any(type(index) is not int
+                                   or not 1 <= index <= len(evidence) for index in indices)):
+                raise AssessmentError(
+                    "platform_semantics relied_at_evidence must cite valid 1-based "
+                    "evidence indices")
+            if any(evidence[index - 1]["revision"] != "target" for index in indices):
+                raise AssessmentError(
+                    "platform_semantics must cite the target call site that relies on "
+                    "the documented semantics")
+            if not set(indices) <= causal_anchor_indices:
+                raise AssessmentError(
+                    "platform_semantics relied_at_evidence must anchor at the causal "
+                    "chain's target_fault/target_harm evidence, not unrelated target code")
+            if not all(self._is_executable_evidence(evidence[index - 1])
+                       for index in indices):
+                raise AssessmentError(
+                    "platform_semantics must cite an executable target call site "
+                    "(comments or declarations alone are not reliance)")
+            simple_name = api.rsplit(".", 1)[-1]
+            if not any(re.search(rf"\b{re.escape(simple_name)}\b",
+                                 evidence[index - 1]["excerpt"]) for index in indices):
+                raise AssessmentError(
+                    f"platform_semantics entry {api!r} must be cited at a target call "
+                    "site whose excerpt mentions the API")
 
     def _turn(self, runtime, prompt: str, *, read_only: bool, phase: str, schema=None) -> dict:
         result = runtime.run(prompt, read_only=read_only, output_schema=schema)
@@ -1282,9 +1369,13 @@ class AospBackportAgent:
                                       "fault, source_fix changed-line evidence for the fix delta, executable "
                                       "target evidence for the equivalent faulty state, executable target "
                                       "evidence for downstream harm, every pattern-required proof step, "
-                                      "representation_equivalence when applicable, and no external behavior assumptions. "
-                                      "If equivalent target impact depends on uncited API behavior, return "
-                                      "UNKNOWN; return NOT_AFFECTED only when the donor-defined faulty data "
+                                      "representation_equivalence when applicable, no external_behavior_assumptions "
+                                      "(cite decisive repository/framework behavior in evidence instead), and "
+                                      "platform_semantics entries {api, behavior, relied_at_evidence} naming "
+                                      "each documented standard-library/platform semantic the harm path relies "
+                                      "on, with the 1-based index of its target call-site evidence. Return "
+                                      "UNKNOWN only when a material step is genuinely unresolved by available "
+                                      "evidence; return NOT_AFFECTED only when the donor-defined faulty data "
                                       "flow is affirmatively absent and cleared by target evidence. "
                                       "Do not edit files.\n" + context)
             assert assessment is not None

@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 
 from aosp_agent.case import Case
-from aosp_agent.engine import AospBackportAgent, _assert_patch_paths, _codex_error_kind, _extract_unified_diff
+from aosp_agent.engine import (AospBackportAgent, AssessmentError, _assert_patch_paths,
+                               _codex_error_kind, _extract_unified_diff)
 from aosp_agent.tests.engine_fixtures import (
     BASELINE, FIXED, PARTIAL, GitFixture, ScriptedRuntime, git, write_counter,
 )
@@ -438,6 +439,7 @@ class AgentTest(unittest.TestCase):
                         "target_fault_state": "The target consumes the old context.",
                         "donor_to_target_mapping": "Both paths consume the same contextual value.",
                         "external_behavior_assumptions": [],
+                        "platform_semantics": [],
                     },
                     "reasoning": "The protective change applies to the target's counterpart.",
                     "limitations": ["fixture"]}
@@ -976,6 +978,151 @@ class AgentTest(unittest.TestCase):
             self.assertTrue(
                 any("f002-h001" in item for item in claims["contradictions"]),
                 claims["contradictions"])
+
+    def test_affected_platform_semantics_do_not_block_impact(self):
+        # seven-410ea70/CVE-2025-48550 lesson: when the harm path flows through
+        # documented standard-library semantics (java.io.File parent/child
+        # resolution), listing them as platform_semantics anchored at the
+        # executable target call site must not force AFFECTED down to UNKNOWN.
+        with GitFixture() as fixture:
+            agent = self.agent(fixture)
+            assessment = fixture.assessment("AFFECTED")
+            assessment["evidence"].append({
+                "revision": "target", "path": "counter.py", "line_start": 4,
+                "line_end": 4, "excerpt": "    out = File(slice_dir, file_name)",
+                "claim": "Target builds the file name with the platform File API."})
+            causal = assessment["causal_chain"]
+            causal["target_harm_evidence"] = [1, 4]
+            causal["platform_semantics"] = [{
+                "api": "java.io.File",
+                "behavior": "accepts child paths containing '/' and '..' without "
+                            "confining resolution to the parent directory",
+                "relied_at_evidence": [4],
+            }]
+            self._with_counter_hunk(agent)
+            agent._validate_impact_causality(assessment)
+
+    def test_platform_semantics_rejects_unanchored_api_name(self):
+        # A libc-colliding bare name whose cited anchor never mentions the
+        # symbol must not launder repo behavior into platform semantics.
+        with GitFixture() as fixture:
+            agent = self.agent(fixture)
+            assessment = fixture.assessment("AFFECTED")
+            assessment["causal_chain"]["platform_semantics"] = [{
+                "api": "read",
+                "behavior": "the target service read() dispatches caller data "
+                            "without a permission check",
+                "relied_at_evidence": [1],
+            }]
+            self._with_counter_hunk(agent)
+            with self.assertRaises(AssessmentError) as ctx:
+                agent._validate_impact_causality(assessment)
+            self.assertIn("excerpt mentions the API", str(ctx.exception))
+
+    def test_platform_semantics_requires_causal_chain_anchor(self):
+        # A plausible platform API anchored at target code outside the causal
+        # chain's target_fault/target_harm evidence is not reliance.
+        with GitFixture() as fixture:
+            agent = self.agent(fixture)
+            assessment = fixture.assessment("AFFECTED")
+            assessment["evidence"].append({
+                "revision": "target", "path": "counter.py", "line_start": 4,
+                "line_end": 4, "excerpt": "    out = File(slice_dir, file_name)",
+                "claim": "Unrelated target File call site."})
+            assessment["causal_chain"]["platform_semantics"] = [{
+                "api": "java.io.File",
+                "behavior": "does not confine child path resolution",
+                "relied_at_evidence": [4],
+            }]
+            self._with_counter_hunk(agent)
+            with self.assertRaises(AssessmentError) as ctx:
+                agent._validate_impact_causality(assessment)
+            self.assertIn("target_fault/target_harm evidence", str(ctx.exception))
+
+    def test_platform_semantics_rejects_non_fqcn_prefix(self):
+        with GitFixture() as fixture:
+            agent = self.agent(fixture)
+            assessment = fixture.assessment("AFFECTED")
+            assessment["causal_chain"]["platform_semantics"] = [{
+                "api": "java.",
+                "behavior": "platform behavior",
+                "relied_at_evidence": [1],
+            }]
+            self._with_counter_hunk(agent)
+            with self.assertRaises(AssessmentError) as ctx:
+                agent._validate_impact_causality(assessment)
+            self.assertIn("not a standard-library/platform API", str(ctx.exception))
+
+    def test_platform_semantics_rejects_repo_implemented_api(self):
+        # When the audited repository is libcore/bionic itself, the "platform"
+        # semantics live inside the analyzed code and must be cited, not
+        # asserted from memory.
+        with GitFixture() as fixture:
+            agent = self.agent(fixture)
+            object.__setattr__(agent.case, "repository", "libcore/luni")
+            assessment = fixture.assessment("AFFECTED")
+            assessment["evidence"].append({
+                "revision": "target", "path": "counter.py", "line_start": 4,
+                "line_end": 4, "excerpt": "    out = File(slice_dir, file_name)",
+                "claim": "Target builds the file name with File."})
+            causal = assessment["causal_chain"]
+            causal["target_harm_evidence"] = [1, 4]
+            causal["platform_semantics"] = [{
+                "api": "java.io.File",
+                "behavior": "does not confine child path resolution",
+                "relied_at_evidence": [4],
+            }]
+            self._with_counter_hunk(agent)
+            with self.assertRaises(AssessmentError) as ctx:
+                agent._validate_impact_causality(assessment)
+            self.assertIn("implemented by the repository under analysis",
+                          str(ctx.exception))
+
+    def test_repo_behavior_cannot_launder_as_platform_semantics(self):
+        with GitFixture() as fixture:
+            agent = self.agent(fixture)
+            assessment = fixture.assessment("AFFECTED")
+            assessment["causal_chain"]["platform_semantics"] = [{
+                "api": "com.android.server.wm.ActivityStarter",
+                "behavior": "starts activities with the supplied options",
+                "relied_at_evidence": [1],
+            }]
+            self._with_counter_hunk(agent)
+            with self.assertRaises(AssessmentError) as ctx:
+                agent._validate_impact_causality(assessment)
+            self.assertIn("not a standard-library/platform API", str(ctx.exception))
+
+    def test_platform_semantics_require_target_call_site(self):
+        with GitFixture() as fixture:
+            agent = self.agent(fixture)
+            assessment = fixture.assessment("AFFECTED")
+            assessment["causal_chain"]["platform_semantics"] = [{
+                "api": "java.io.File",
+                "behavior": "does not confine child path resolution",
+                "relied_at_evidence": [2],
+            }]
+            self._with_counter_hunk(agent)
+            with self.assertRaises(AssessmentError) as ctx:
+                agent._validate_impact_causality(assessment)
+            self.assertIn("must cite the target call site", str(ctx.exception))
+
+    def test_uncited_repo_behavior_still_blocks_affected(self):
+        with GitFixture() as fixture:
+            agent = self.agent(fixture)
+            assessment = fixture.assessment("AFFECTED")
+            assessment["causal_chain"]["external_behavior_assumptions"] = [
+                "ActivityTaskManager resolves the intent synchronously"]
+            self._with_counter_hunk(agent)
+            with self.assertRaises(AssessmentError) as ctx:
+                agent._validate_impact_causality(assessment)
+            self.assertIn("cannot rest on uncited repository/framework behavior",
+                          str(ctx.exception))
+
+    def _with_counter_hunk(self, agent):
+        agent._current_hunks = [{
+            "id": "f001-h001", "path": "counter.py",
+            "old_start": 1, "new_start": 1,
+            "patch": "@@ -1,1 +1,1 @@\n-return value\n+return max(0, min(value, 10))\n"}]
 
     def test_impact_turn_sees_clean_baseline_before_mechanical_landing(self):
         with GitFixture() as fixture:

@@ -126,6 +126,7 @@ class GitFixture:
                 "target_fault_state": "The target returns the caller's count without clamping it.",
                 "donor_to_target_mapping": "Both normalize_count functions consume the same count value and return it to the caller.",
                 "external_behavior_assumptions": [],
+                "platform_semantics": [],
             }
         return assessment
 

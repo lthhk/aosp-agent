@@ -264,11 +264,36 @@ class CodexRuntime:
                     output = json.loads(repaired)
                 except ValueError:
                     output = None
+                else:
+                    self._log("output_json_repaired", thread_id=self._thread.id,
+                              original_tail=text[-40:], repaired_tail=repaired[-16:])
+                    result["json_repaired"] = True
+            if output is None:
+                # Trailing-content recovery: models sometimes append prose or
+                # a second document after one complete JSON value. Take the
+                # first complete value — but if the dropped remainder is
+                # itself a complete JSON document it may be the model's
+                # corrected answer, so decline and let the corrective re-ask
+                # resolve it. The schema validator still gates every value.
+                try:
+                    candidate, end = json.JSONDecoder().raw_decode(text.lstrip())
+                except ValueError:
+                    candidate = None
+                remainder = text.lstrip()[end:].lstrip() if candidate is not None else ""
+                second = None
+                if remainder:
+                    try:
+                        second, _ = json.JSONDecoder().raw_decode(remainder)
+                    except ValueError:
+                        second = None
+                if isinstance(candidate, dict) and second is None:
+                    output = candidate
+                    self._log("output_json_prefix_recovered", thread_id=self._thread.id,
+                              trailing_bytes=len(text.lstrip()) - end,
+                              trailing_excerpt=text.lstrip()[end:end + 80])
+                    result["json_prefix_recovered"] = True
             if output is None:
                 return None, error_text
-            self._log("output_json_repaired", thread_id=self._thread.id,
-                      original_tail=text[-40:], repaired_tail=repaired[-16:])
-            result["json_repaired"] = True
         if self._deepseek_schema_compat and output_schema is not None:
             output = _remove_wire_only_nulls(output, output_schema)
         if validator is not None:

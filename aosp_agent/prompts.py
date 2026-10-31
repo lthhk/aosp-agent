@@ -129,10 +129,23 @@ IMPACT_SCHEMA = {
                 "target_fault_state": {"type": "string", "minLength": 1},
                 "donor_to_target_mapping": {"type": "string", "minLength": 1},
                 "external_behavior_assumptions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+                "platform_semantics": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "api": {"type": "string", "minLength": 1},
+                            "behavior": {"type": "string", "minLength": 1},
+                            "relied_at_evidence": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1},
+                        },
+                        "required": ["api", "behavior", "relied_at_evidence"],
+                    },
+                },
             },
             "required": ["donor_fault_evidence", "donor_fix_evidence", "target_fault_evidence",
                          "target_harm_evidence", "target_fault_state", "donor_to_target_mapping",
-                         "external_behavior_assumptions"],
+                         "external_behavior_assumptions", "platform_semantics"],
         },
         "reasoning": {"type": "string", "minLength": 1},
         "limitations": {"type": "array", "items": {"type": "string", "minLength": 1}},
@@ -228,6 +241,17 @@ def parse_impact_response(payload: "str | dict[str, Any]") -> dict[str, Any]:
         if (not isinstance(assumptions, list)
                 or any(not isinstance(item, str) or not item.strip() for item in assumptions)):
             raise ValueError("impact causal_chain external_behavior_assumptions must be a list of nonempty strings")
+        semantics = causal["platform_semantics"]
+        if not isinstance(semantics, list):
+            raise ValueError("impact causal_chain platform_semantics must be a list")
+        for item in semantics:
+            if (not isinstance(item, dict) or set(item) != {"api", "behavior", "relied_at_evidence"}
+                    or not isinstance(item["api"], str) or not item["api"].strip()
+                    or not isinstance(item["behavior"], str) or not item["behavior"].strip()
+                    or not isinstance(item["relied_at_evidence"], list) or not item["relied_at_evidence"]
+                    or any(type(index) is not int or index < 1 for index in item["relied_at_evidence"])):
+                raise ValueError("impact causal_chain platform_semantics entries must be "
+                                 "{api, behavior, relied_at_evidence} with nonempty 1-based indices")
     fields = set(IMPACT_SCHEMA["properties"]["evidence"]["items"]["required"])
     for item in raw["evidence"]:
         if not isinstance(item, dict) or set(item) != fields:
@@ -470,10 +494,21 @@ Fix-defined causal chain (required for every AFFECTED conclusion):
   with executable target code.
 - A target mechanism missing the donor's newer protection is not sufficient. Prove the target already
   reaches the same faulty value/decision before the donor fix would apply.
-- Put every assumption about behavior of an API/type whose implementation is not cited from the
-  supplied repository in external_behavior_assumptions. If such an assumption is required to prove
-  target impact, do not return AFFECTED: use UNKNOWN when impact is unresolved, or NOT_AFFECTED only
-  when the donor fix's faulty data flow is affirmatively absent from the target.
+- Assumptions about behavior of code whose implementation lives in the donor or target
+  repositories but is not cited from the supplied evidence belong in
+  external_behavior_assumptions. An AFFECTED verdict must not rest on them: cite the
+  behavior in evidence instead. Use NOT_AFFECTED only when the donor fix's faulty data
+  flow is affirmatively absent from the target, and UNKNOWN only when a material step is
+  genuinely unresolved by available evidence — never to avoid a difficult, source-provable
+  conclusion.
+- Documented semantics of standard libraries and the platform runtime that exist outside
+  both repositories (java.*, javax.*, libcore, the C/libc runtime) do not vary between the
+  donor and target branches. When the harm path relies on such semantics (for example
+  java.io.File parent/child resolution, libc string handling), list each one in
+  platform_semantics with its api name, the documented behavior relied on, and the 1-based
+  index of the target evidence excerpt at the call site that relies on it. Verified
+  platform_semantics do not block AFFECTED; repository-defined behavior must never be
+  listed there.
 
 Cite exact existing snippets, revision labels, repository-relative paths, and 1-based lines.
 Limit exploration to the named candidate files and a small number of directly referenced API files;

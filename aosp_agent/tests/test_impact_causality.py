@@ -40,6 +40,7 @@ def assessment(**causal_updates):
         "target_fault_state": "The target returns an unbounded value.",
         "donor_to_target_mapping": "Both paths return the same count to the caller.",
         "external_behavior_assumptions": [],
+        "platform_semantics": [],
     }
     causal.update(causal_updates)
     return {
@@ -152,7 +153,7 @@ class ImpactCausalityTest(unittest.TestCase):
     def test_external_behavior_assumption_cannot_prove_affected(self):
         raw = assessment(external_behavior_assumptions=[
             "DefaultDialerManager returns a phantom dialer in the work profile"])
-        with self.assertRaisesRegex(AssessmentError, "external API behavior"):
+        with self.assertRaisesRegex(AssessmentError, "uncited repository/framework behavior"):
             self.agent()._validate_impact_causality(raw)
 
     def test_target_comment_is_not_executable_fault_evidence(self):
